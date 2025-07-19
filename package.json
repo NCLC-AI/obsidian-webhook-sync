@@ -4,9 +4,9 @@
 	"description": "This is a webhook-sync plugin for Obsidian (https://obsidian.md)",
 	"main": "main.js",
 	"scripts": {
-		"dev": "node esbuild.config.mjs",
-		"build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
-		"version": "node version-bump.mjs && git add manifest.json versions.json"
+		"dev": "esbuild src/main.ts --bundle --external:obsidian --outfile=main.js --format=cjs --target=es2018 --sourcemap=inline --watch",
+		"build": "esbuild src/main.ts --bundle --external:obsidian --outfile=main.js --format=cjs --target=es2018",
+		"release": "npm run build && node version-bump.mjs && git add . && git commit -m \"Release version\" && git push"
 	},
 	"keywords": [],
 	"author": "",
