@@ -9,7 +9,9 @@ interface WebhookSyncSettings {
 	enableRealTimeSync: boolean;
 	debounceDelayMs: number;
 	batchSize: number;
-	initialSyncBatchSize: number; // 초기 동기화용 배치 크기
+	initialSyncBatchSize: number;
+	forceInboundWebhookUrl: string; // 새로운 Force Inbound URL
+	autoForceInboundOnStartup: boolean; // 시작시 Force Inbound 실행 여부
 }
 
 const DEFAULT_SETTINGS: WebhookSyncSettings = {
@@ -21,7 +23,9 @@ const DEFAULT_SETTINGS: WebhookSyncSettings = {
 	enableRealTimeSync: false,
 	debounceDelayMs: 3000,
 	batchSize: 10,
-	initialSyncBatchSize: 5 // 초기 동기화는 더 작은 배치로
+	initialSyncBatchSize: 5,
+	forceInboundWebhookUrl: '', // 새로운 기본값
+	autoForceInboundOnStartup: false // 새로운 기본값
 }
 
 interface ChangeEvent {
@@ -196,7 +200,7 @@ class ChangeQueue {
 	
 	constructor(private plugin: WebhookSyncPlugin) {}
 	
-	async addChange(event: ChangeEvent): Promise<void> {
+	async addChange(event: ChangeEvent): Promise {
 		// Get file stats if file exists
 		if (event.file) {
 			event.ctime = event.file.stat.ctime;
@@ -331,7 +335,7 @@ class ChangeQueue {
 		return changes;
 	}
 	
-	private delay(ms: number): Promise<void> {
+	private delay(ms: number): Promise {
 		return new Promise(resolve => setTimeout(resolve, ms));
 	}
 	
@@ -352,7 +356,7 @@ class ChangeQueue {
 		const changes = await this.prepareBatchData(batch);
 		const payload = {
 			timestamp: new Date().toISOString(),
-			isInitialSync: true, // 초기 동기화 플래그
+			isInitialSync: true,
 			changes: changes
 		};
 		
@@ -427,12 +431,20 @@ export default class WebhookSyncPlugin extends Plugin {
 			}
 		});
 		
-		// 새로운 명령어: 초기 동기화
 		this.addCommand({
 			id: 'initial-sync-all-notes',
 			name: 'Initial Sync: Send all notes to webhook',
 			callback: () => {
 				this.startInitialSync();
+			}
+		});
+
+		// 새로운 Force Inbound 명령어 추가
+		this.addCommand({
+			id: 'force-inbound-sync',
+			name: 'Force Inbound Sync: Get documents from webhook',
+			callback: () => {
+				this.forceInboundSync();
 			}
 		});
 
@@ -448,6 +460,13 @@ export default class WebhookSyncPlugin extends Plugin {
 			setTimeout(() => {
 				this.syncFromWebhook();
 			}, 2000);
+		}
+
+		// Auto Force Inbound sync on startup
+		if (this.settings.autoForceInboundOnStartup) {
+			setTimeout(() => {
+				this.forceInboundSync();
+			}, 3000);
 		}
 
 		this.startPeriodicSync();
@@ -499,6 +518,131 @@ export default class WebhookSyncPlugin extends Plugin {
 	}
 
 	/**
+	 * NEW: Force Inbound Sync - 강제로 webhook에서 문서들을 가져와 동기화
+	 */
+	async forceInboundSync() {
+		if (!this.settings.forceInboundWebhookUrl) {
+			new Notice('❌ Force Inbound Webhook URL is not configured. Please set it in settings.');
+			return;
+		}
+
+		this.log('=== Starting Force Inbound Sync ===', { url: this.settings.forceInboundWebhookUrl });
+		new Notice('⚡ Force syncing documents from webhook...');
+
+		try {
+			this.log('Sending HTTP request for force inbound...');
+			const response = await fetch(this.settings.forceInboundWebhookUrl);
+			
+			this.log('Force inbound response received', {
+				status: response.status,
+				ok: response.ok,
+				contentType: response.headers.get('content-type')
+			});
+
+			if (!response.ok) {
+				throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+			}
+
+			const responseText = await response.text();
+			this.log('Force inbound response text read', {
+				length: responseText.length,
+				preview: responseText.substring(0, 200)
+			});
+
+			const data = JSON.parse(responseText);
+			this.log('Force inbound JSON parsing complete', data);
+
+			if (!data || typeof data !== 'object') {
+				throw new Error('Response is not an object');
+			}
+
+			if (!data.documents) {
+				throw new Error('Missing "documents" field in response');
+			}
+
+			if (!Array.isArray(data.documents)) {
+				throw new Error('documents field is not an array');
+			}
+
+			this.log('Force inbound data validation complete', {
+				documentsCount: data.documents.length
+			});
+
+			let successCount = 0;
+			let errorCount = 0;
+
+			for (let i = 0; i < data.documents.length; i++) {
+				const doc = data.documents[i];
+				try {
+					await this.processForceInboundDocument(doc);
+					successCount++;
+					this.log(`Force inbound document ${i+1} processed successfully: ${doc.filename || doc.filepath}`);
+				} catch (error) {
+					console.error(`Force inbound document ${i+1} processing failed:`, error);
+					errorCount++;
+				}
+			}
+
+			const resultMsg = `⚡ Force Inbound sync complete: ${successCount} succeeded, ${errorCount} failed`;
+			new Notice(resultMsg);
+			this.log(resultMsg);
+
+		} catch (error) {
+			const errorMsg = `❌ Force Inbound sync failed: ${error.message}`;
+			console.error('[WebhookSync Force Inbound ERROR]', error);
+			new Notice(errorMsg);
+		}
+	}
+
+	/**
+	 * NEW: Process Force Inbound document with filepath, filename, content format
+	 */
+	async processForceInboundDocument(doc: any) {
+		if (!doc.filename && !doc.filepath) {
+			throw new Error('Document missing filename or filepath');
+		}
+
+		if (typeof doc.content !== 'string') {
+			throw new Error('Document content is not a string');
+		}
+
+		// Use filepath if available, otherwise use filename
+		let filePath = doc.filepath || doc.filename;
+		
+		// Ensure .md extension
+		if (!filePath.endsWith('.md')) {
+			filePath += '.md';
+		}
+
+		this.log('Force inbound file path determined', { 
+			filepath: doc.filepath || 'none',
+			filename: doc.filename || 'none', 
+			final: filePath 
+		});
+
+		// Create folder structure if needed
+		const folderPath = filePath.substring(0, filePath.lastIndexOf('/'));
+		if (folderPath) {
+			const folder = this.app.vault.getAbstractFileByPath(folderPath);
+			if (!folder) {
+				this.log('Creating folder for force inbound', { path: folderPath });
+				await this.app.vault.createFolder(folderPath);
+			}
+		}
+
+		// Create or update file
+		const existingFile = this.app.vault.getAbstractFileByPath(filePath);
+		
+		if (existingFile instanceof TFile) {
+			this.log('Updating existing file (force inbound)', { path: filePath });
+			await this.app.vault.modify(existingFile, doc.content);
+		} else {
+			this.log('Creating new file (force inbound)', { path: filePath });
+			await this.app.vault.create(filePath, doc.content);
+		}
+	}
+
+	/**
 	 * Start initial sync of all existing notes
 	 */
 	async startInitialSync() {
@@ -534,7 +678,7 @@ export default class WebhookSyncPlugin extends Plugin {
 		await this.processInitialSync(markdownFiles);
 	}
 
-	private async confirmInitialSync(fileCount: number): Promise<boolean> {
+	private async confirmInitialSync(fileCount: number): Promise {
 		return new Promise((resolve) => {
 			const modal = new Modal(this.app);
 			modal.contentEl.createEl('h2', { text: '🚀 Initial Sync Confirmation' });
@@ -611,7 +755,7 @@ export default class WebhookSyncPlugin extends Plugin {
 
 				// Wait between batches to avoid overwhelming the server
 				if (i < totalBatches - 1) {
-					await this.delay(1000); // 1초 대기
+					await this.delay(1000);
 				}
 			}
 
@@ -635,7 +779,7 @@ export default class WebhookSyncPlugin extends Plugin {
 		}
 	}
 
-	private delay(ms: number): Promise<void> {
+	private delay(ms: number): Promise {
 		return new Promise(resolve => setTimeout(resolve, ms));
 	}
 
@@ -730,7 +874,7 @@ export default class WebhookSyncPlugin extends Plugin {
 		new Notice(`${icon} Real-time sync ${status}`);
 	}
 
-	// === EXISTING INBOUND SYNC METHODS (unchanged) ===
+	// === EXISTING INBOUND SYNC METHODS (Queue-based) ===
 	
 	async syncFromWebhook() {
 		if (!this.settings.webhookUrl) {
@@ -738,7 +882,7 @@ export default class WebhookSyncPlugin extends Plugin {
 			return;
 		}
 
-		this.log('=== Starting inbound sync ===', { url: this.settings.webhookUrl });
+		this.log('=== Starting inbound sync (queue-based) ===', { url: this.settings.webhookUrl });
 		new Notice('🔄 Syncing documents from webhook...');
 
 		try {
@@ -884,8 +1028,42 @@ class WebhookSyncSettingTab extends PluginSettingTab {
 
 		containerEl.createEl('h2', {text: '🔄 Webhook Sync Settings'});
 
-		// === INBOUND SYNC ===
-		containerEl.createEl('h3', {text: '📥 Inbound Sync (from webhook to Obsidian)'});
+		// === FORCE INBOUND SYNC (NEW SECTION) ===
+		containerEl.createEl('h3', {text: '⚡ Force Inbound Sync (Immediate sync from webhook)'});
+		
+		new Setting(containerEl)
+			.setName('Force Inbound Webhook URL')
+			.setDesc('Webhook endpoint for immediate document sync (expects filepath, filename, content format)')
+			.addText(text => text
+				.setPlaceholder('https://your-webhook.com/force-inbound')
+				.setValue(this.plugin.settings.forceInboundWebhookUrl)
+				.onChange(async (value) => {
+					this.plugin.settings.forceInboundWebhookUrl = value;
+					await this.plugin.saveSettings();
+				}));
+
+		new Setting(containerEl)
+			.setName('Auto Force Inbound on Startup')
+			.setDesc('Automatically trigger force inbound sync when Obsidian starts')
+			.addToggle(toggle => toggle
+				.setValue(this.plugin.settings.autoForceInboundOnStartup)
+				.onChange(async (value) => {
+					this.plugin.settings.autoForceInboundOnStartup = value;
+					await this.plugin.saveSettings();
+				}));
+
+		new Setting(containerEl)
+			.setName('Force Inbound Sync Now')
+			.setDesc('Manually trigger force inbound sync right now')
+			.addButton(button => button
+				.setButtonText('⚡ Force Sync Now')
+				.setCta()
+				.onClick(() => {
+					this.plugin.forceInboundSync();
+				}));
+
+		// === REGULAR INBOUND SYNC ===
+		containerEl.createEl('h3', {text: '📥 Regular Inbound Sync (Queue-based sync from webhook)'});
 		
 		new Setting(containerEl)
 			.setName('Inbound Webhook URL')
@@ -1007,10 +1185,10 @@ class WebhookSyncSettingTab extends PluginSettingTab {
 				}));
 
 		new Setting(containerEl)
-			.setName('Manual Sync')
-			.setDesc('Manually trigger sync right now')
+			.setName('Manual Regular Sync')
+			.setDesc('Manually trigger regular inbound sync right now')
 			.addButton(button => button
-				.setButtonText('🔄 Sync Now')
+				.setButtonText('🔄 Regular Sync Now')
 				.setCta()
 				.onClick(() => {
 					this.plugin.syncFromWebhook();
@@ -1023,9 +1201,31 @@ class WebhookSyncSettingTab extends PluginSettingTab {
 	private addDocumentationSection(containerEl: HTMLElement) {
 		containerEl.createEl('h3', {text: '📋 Webhook Payload Formats'});
 		
-		// Inbound format
-		containerEl.createEl('h4', {text: 'Inbound (Expected Response Format)'});
-		containerEl.createEl('p', {text: 'Your inbound webhook should return JSON in this format:'});
+		// Force Inbound format
+		containerEl.createEl('h4', {text: 'Force Inbound (Expected Response Format)'});
+		containerEl.createEl('p', {text: 'Your force inbound webhook should return JSON in this format:'});
+		
+		const forceInboundExample = {
+			documents: [
+				{
+					filepath: "folder/document1.md",
+					filename: "document1.md",
+					content: "# Document 1\\n\\nContent here..."
+				},
+				{
+					filepath: "notes/another-note.md", 
+					filename: "another-note.md",
+					content: "# Another Note\\n\\nMore content..."
+				}
+			]
+		};
+		
+		const forceInboundCodeEl = containerEl.createEl('pre');
+		forceInboundCodeEl.createEl('code', {text: JSON.stringify(forceInboundExample, null, 2)});
+		
+		// Regular Inbound format
+		containerEl.createEl('h4', {text: 'Regular Inbound (Expected Response Format)'});
+		containerEl.createEl('p', {text: 'Your regular inbound webhook should return JSON in this format:'});
 		
 		const inboundExample = {
 			documents: [
@@ -1083,6 +1283,6 @@ class WebhookSyncSettingTab extends PluginSettingTab {
 		const outboundCodeEl = containerEl.createEl('pre');
 		outboundCodeEl.createEl('code', {text: JSON.stringify(outboundExample, null, 2)});
 		
-		containerEl.createEl('p', {text: 'Note: isInitialSync flag indicates if this is from the initial sync operation. oldPath is included for rename and delete operations.'});
+		containerEl.createEl('p', {text: 'Note: isInitialSync flag indicates if this is from the initial sync operation. oldPath is included for rename and delete operations. Force Inbound expects filepath (full path) and filename fields.'});
 	}
 }
